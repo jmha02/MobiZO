@@ -51,8 +51,6 @@ def parse_args():
     parser.add_argument("--max_iterations", type=int, default=25000, help="Log every X epochs.")
     parser.add_argument("--split",  type=str2bool, default=False , help="Split batch between perturbations.")
     parser.add_argument("--mixed_precision",  type=str2bool, default=False , help="Split batch between perturbations.")
-    parser.add_argument('--spsa_config', type=str, default=None,
-                        help='JSON string containing n, per_device_train_batch_size, and split')
     parser.add_argument('--peft', type=str, choices=["no", "lora", "lora-fa"], default="lora-fa", help="PEFT method.")
     parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank.")
     parser.add_argument("--compute_dtype", type=str, default="fp16", choices=["bf16" ,"fp16", "fp32"], help="Compute dtype.")
@@ -69,15 +67,6 @@ def main():
     if args.total_batch_size is not None:
         assert args.total_batch_size == args.per_device_train_batch_size * num_gpus, "Total batch size must be equal to per_device_train_batch_size * num_gpus"
 
-    if args.spsa_config is not None:
-        print("Overriding args with SPSA config")
-        import json
-        spsa_config = json.loads(args.spsa_config)
-        args.n = spsa_config["n"]
-        args.per_device_train_batch_size = spsa_config["per_device_train_batch_size"]
-        args.split = spsa_config["split"]
-        print(f"SPSA config: {spsa_config}")
-
     print(f"Run args: {args}")
     set_seed(args.seed)
     # compute_dtype = torch.float32 if args.optimizer == "fo" else torch.float16
@@ -89,7 +78,7 @@ def main():
     compute_dtype = compute_types[args.compute_dtype]
 
     run_name = f"{args.task_name}-{args.optimizer}-{args.model_name_or_path}-n{args.n}-bs{args.per_device_train_batch_size}-lr{args.learning_rate}-eps{args.eps}-epochs{args.num_train_epochs}_seed{args.seed}_split{args.split}_mp{args.mixed_precision}_dtype{compute_dtype}_peft{args.peft}_r{args.lora_rank}_alpha{args.lora_alpha}"
-    wandb.init(project="PRGE", name=run_name, config=args)
+    wandb.init(project="MobiZO", name=run_name, config=args)
     print(f"Run name: {run_name}")
         
 

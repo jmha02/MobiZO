@@ -24,6 +24,8 @@ Detailed hyperparameter configurations can be found in the `experiments` folder.
 
 The scripts are organized by training type: zero-shot learning, first-order training, and zeroth-order training. Within each category, they are further grouped by model and dataset.
 
+`main.py` supports `--peft no`, `--peft lora-fa`, and `--peft lora`.
+
 To reproduce the main results in **Table 1**, run:
 
 ```bash

@@ -21,6 +21,10 @@ def get_trainable_parameters(model):
     )
 
 
+def projected_grad_view(projected_grad, target):
+    return projected_grad.view(-1, *([1] * (target.ndim - 1)))
+
+
 def fp16_zo_eval(func):
     def wrapper(self, *args, **kwargs):
         zo_eval_dtype = torch.float16
@@ -197,7 +201,7 @@ class Trainer:
                 if self.args.n == 1:
                     z = -self.args.learning_rate * projected_grad * torch.randn_like(param)
                 else:
-                    z = -self.args.learning_rate * (projected_grad.view(-1, 1, 1) * torch.randn_like(param)).mean(dim=0, keepdim=True)
+                    z = -self.args.learning_rate * (projected_grad_view(projected_grad, param) * torch.randn_like(param)).mean(dim=0, keepdim=True)
                 param.data.add_(z)
 
         return loss1.mean()
@@ -240,11 +244,12 @@ class Trainer:
 
             torch.manual_seed(self.rand_seed)
             for name, param in self.trainable_parameters.items():
+                base_param = param.data[:self.args.n]
                 projected_grad = projected_grad.to(param.device)
                 if self.args.n == 1:
-                    z = self.args.learning_rate * projected_grad * torch.randn_like(param.data[:self.args.n])
+                    z = self.args.learning_rate * projected_grad * torch.randn_like(base_param)
                 else:
-                    z = self.args.learning_rate * (projected_grad.view(-1, 1, 1) * torch.randn_like(param.data[:self.args.n])).mean(dim=0, keepdim=True)
+                    z = self.args.learning_rate * (projected_grad_view(projected_grad, base_param) * torch.randn_like(base_param)).mean(dim=0, keepdim=True)
                 param.data[:self.args.n].sub_(z)
                 param.data[self.args.n:].sub_(z)
 

@@ -105,10 +105,10 @@ def main():
             # target_modules=["q_proj", "v_proj"] if "Tiny" not in args.model_name_or_path else ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             # target_modules=["q_proj", "v_proj"],
-            zo_mode=args.zo_mode)
+            zo_mode=args.zo_mode,
+            peft_method=args.peft)
 
         model = get_peft_model(model, lora_config)
-        print_trainable_parameters(model)
 
     if args.peft in ["lora", "lora-fa"]:
         for name, param in model.named_parameters():
@@ -121,6 +121,8 @@ def main():
             param.requires_grad = True
     else:
         raise ValueError(f"Unknown peft mode: {args.peft}")
+
+    print_trainable_parameters(model)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False, padding_side="left", truncation_side="left")
     if "Llama" in args.model_name_or_path:

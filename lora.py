@@ -50,28 +50,26 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def _reshape_batched_input(self, x: torch.Tensor):
-        bsz = x.size(0)
-        if bsz % self.dup != 0:
-            raise ValueError(f"Batch size {bsz} must be divisible by duplication factor {self.dup}")
-        return x.reshape(self.dup, bsz // self.dup, x.size(1), x.size(2)), bsz, x.size(1)
+        first_dim = x.size(0)
+        if first_dim % self.dup != 0:
+            raise ValueError(f"Leading dimension {first_dim} must be divisible by duplication factor {self.dup}")
+        return x.reshape(self.dup, first_dim // self.dup, *x.shape[1:])
 
     def forward(self, x: torch.Tensor):
         if self.training:
             frozen_out = self.base_layer(x)
             dropped_x = self.lora_dropout(x)
+            output_shape = (*x.shape[:-1], self.out_features)
 
             if self.peft_method == "lora-fa":
                 lora_out = dropped_x @ self.lora_A.transpose(0, 1)
-                lora_out, bsz, seq_len = self._reshape_batched_input(lora_out)
+                lora_out = self._reshape_batched_input(lora_out)
             else:
-                grouped_x, bsz, seq_len = self._reshape_batched_input(dropped_x)
-                lora_out = torch.matmul(grouped_x, self.lora_A.transpose(1, 2).unsqueeze(1))
+                grouped_x = self._reshape_batched_input(dropped_x)
+                lora_out = torch.einsum("d...i,dri->d...r", grouped_x, self.lora_A)
 
-            lora_out = torch.matmul(
-                lora_out,
-                self.lora_B.transpose(1, 2).unsqueeze(1),
-            ) * self.scaling
-            lora_out = lora_out.reshape(bsz, seq_len, self.out_features)
+            lora_out = torch.einsum("d...r,dor->d...o", lora_out, self.lora_B) * self.scaling
+            lora_out = lora_out.reshape(output_shape)
             return frozen_out + lora_out
         else:
             frozen_out = self.base_layer(x)

@@ -103,8 +103,12 @@ def apply_rotary_emb(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
-    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+    xq_ri = xq.float().reshape(xq.shape[:-1] + (-1, 2))
+    xk_ri = xk.float().reshape(xk.shape[:-1] + (-1, 2))
+    xq_r = xq_ri[..., 0]
+    xq_i = xq_ri[..., 1]
+    xk_r = xk_ri[..., 0]
+    xk_i = xk_ri[..., 1]
 
     freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
     freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)

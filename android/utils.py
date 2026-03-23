@@ -33,11 +33,18 @@ from executorch.exir.backend.backend_api import to_backend
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from torch.ao.quantization.observer import MovingAverageMinMaxObserver
-from torch.ao.quantization.quantize_pt2e import (
-    convert_pt2e,
-    prepare_pt2e,
-    prepare_qat_pt2e,
-)
+try:
+    from torch.ao.quantization.quantize_pt2e import (
+        convert_pt2e,
+        prepare_pt2e,
+        prepare_qat_pt2e,
+    )
+except ModuleNotFoundError:
+    from torchao.quantization.pt2e.quantize_pt2e import (
+        convert_pt2e,
+        prepare_pt2e,
+        prepare_qat_pt2e,
+    )
 
 
 class SimpleADB:

@@ -72,14 +72,13 @@ class RMSNorm(torch.nn.Module):
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
+    repeated_heads = []
+    for kv_idx in range(x.shape[2]):
+        head = x[:, :, kv_idx : kv_idx + 1, :]
+        repeated_heads.extend([head] * n_rep)
+    return torch.cat(repeated_heads, dim=2)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -260,11 +259,41 @@ class Llama2Model(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.model = Transformer(params)
-        
+
         self.lm_head = nn.Linear(params.dim, params.vocab_size, bias=False)
-    
+
     def forward(self, x):
         h = self.model(x)
         logits = self.lm_head(h)
 
         return logits
+
+
+class Llama2EmbeddingModel(nn.Module):
+    def __init__(self, transformer: Transformer):
+        super().__init__()
+        self.embed_tokens = transformer.embed_tokens
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(tokens)
+
+
+class Llama2DecoderModel(nn.Module):
+    def __init__(self, transformer: Transformer, lm_head: nn.Linear):
+        super().__init__()
+        self.layers = transformer.layers
+        self.norm = transformer.norm
+        self.lm_head = lm_head
+        self.register_buffer("freqs_cos", transformer.freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", transformer.freqs_sin, persistent=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        seqlen = hidden_states.shape[1]
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        h = hidden_states
+        for layer in self.layers:
+            h = layer(h, freqs_cos, freqs_sin)
+        h = self.norm(h)
+        return self.lm_head(h)

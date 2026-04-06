@@ -1,10 +1,12 @@
 import math
+from pathlib import Path
 
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
+from safetensors import safe_open
 from torch import nn
 
 
@@ -17,6 +19,7 @@ class GPT2Config:
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = True
+    tie_word_embeddings: bool = False
 
 
 class LayerNorm(nn.Module):
@@ -148,7 +151,10 @@ class GPT2Model(nn.Module):
         super().__init__()
         self.transformer = GPT2Backbone(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.transformer.wte.weight
+        else:
+            torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         hidden_states = self.transformer(tokens)
@@ -184,3 +190,87 @@ class GPT2DecoderModel(nn.Module):
             x = block(x)
         x = self.ln_f(x)
         return self.lm_head(x)
+
+
+def make_gpt2_small_config(block_size: int = 128) -> GPT2Config:
+    return GPT2Config(
+        block_size=block_size,
+        vocab_size=50257,
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        dropout=0.0,
+        bias=True,
+        tie_word_embeddings=True,
+    )
+
+
+def load_pretrained_gpt2_weights(
+    model: GPT2Model, pretrained_dir: str | Path
+) -> GPT2Model:
+    pretrained_dir = Path(pretrained_dir)
+    checkpoint_path = pretrained_dir / "model.safetensors"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Missing checkpoint: {checkpoint_path}")
+
+    config = model.transformer.config
+    if config.tie_word_embeddings and model.lm_head.weight is not model.transformer.wte.weight:
+        raise ValueError("Expected tied word embeddings for pretrained GPT-2 load.")
+
+    with torch.no_grad(), safe_open(
+        str(checkpoint_path), framework="pt", device="cpu"
+    ) as checkpoint:
+        position_weight = checkpoint.get_tensor("wpe.weight")
+        if config.block_size > position_weight.shape[0]:
+            raise ValueError(
+                f"block_size {config.block_size} exceeds pretrained position embeddings "
+                f"{position_weight.shape[0]}"
+            )
+
+        model.transformer.wte.weight.copy_(checkpoint.get_tensor("wte.weight"))
+        model.transformer.wpe.weight.copy_(position_weight[: config.block_size])
+
+        for layer_idx, block in enumerate(model.transformer.h):
+            prefix = f"h.{layer_idx}"
+
+            block.ln_1.weight.copy_(checkpoint.get_tensor(f"{prefix}.ln_1.weight"))
+            block.ln_1.bias.copy_(checkpoint.get_tensor(f"{prefix}.ln_1.bias"))
+            block.ln_2.weight.copy_(checkpoint.get_tensor(f"{prefix}.ln_2.weight"))
+            block.ln_2.bias.copy_(checkpoint.get_tensor(f"{prefix}.ln_2.bias"))
+
+            attn_weight = checkpoint.get_tensor(f"{prefix}.attn.c_attn.weight")
+            q_weight, k_weight, v_weight = attn_weight.split(config.n_embd, dim=1)
+            block.attn.q_proj.weight.copy_(q_weight.t().contiguous())
+            block.attn.k_proj.weight.copy_(k_weight.t().contiguous())
+            block.attn.v_proj.weight.copy_(v_weight.t().contiguous())
+
+            attn_bias = checkpoint.get_tensor(f"{prefix}.attn.c_attn.bias")
+            q_bias, k_bias, v_bias = attn_bias.split(config.n_embd, dim=0)
+            block.attn.q_proj.bias.copy_(q_bias)
+            block.attn.k_proj.bias.copy_(k_bias)
+            block.attn.v_proj.bias.copy_(v_bias)
+
+            block.attn.c_proj.weight.copy_(
+                checkpoint.get_tensor(f"{prefix}.attn.c_proj.weight").t().contiguous()
+            )
+            block.attn.c_proj.bias.copy_(
+                checkpoint.get_tensor(f"{prefix}.attn.c_proj.bias")
+            )
+
+            block.mlp.c_fc.weight.copy_(
+                checkpoint.get_tensor(f"{prefix}.mlp.c_fc.weight").t().contiguous()
+            )
+            block.mlp.c_fc.bias.copy_(checkpoint.get_tensor(f"{prefix}.mlp.c_fc.bias"))
+            block.mlp.c_proj.weight.copy_(
+                checkpoint.get_tensor(f"{prefix}.mlp.c_proj.weight").t().contiguous()
+            )
+            block.mlp.c_proj.bias.copy_(
+                checkpoint.get_tensor(f"{prefix}.mlp.c_proj.bias")
+            )
+
+        model.transformer.ln_f.weight.copy_(checkpoint.get_tensor("ln_f.weight"))
+        model.transformer.ln_f.bias.copy_(checkpoint.get_tensor("ln_f.bias"))
+        if not config.tie_word_embeddings:
+            model.lm_head.weight.copy_(checkpoint.get_tensor("wte.weight"))
+
+    return model

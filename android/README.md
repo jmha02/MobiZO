@@ -48,3 +48,44 @@ python qnn.py -s 7500709c -m SM8650 -b $EXECUTORCH_ROOT/build-android
 * -b: Path to the Android build directory for ExecuTorch
 
 ### Check detailed tutorial from [ExecuTorch](https://pytorch.org/executorch/stable/build-run-qualcomm-ai-engine-direct-backend.html)
+
+## CPU Training Baseline
+
+For the official ExecuTorch-style CPU training baseline, use the export/run
+helpers under `android/et/` together with the native Android runner sources in
+`android/et/training_runner/`.
+
+Export the training artifact:
+
+```bash
+cd /home/jmha/MobiZO
+source /home/jmha/hetllm/scripts/env.sh
+export PYTHONPATH=$EXECUTORCH_ROOT:$PYTHONPATH
+
+python android/et/et_export.py \
+  --no_xnnpack \
+  --export_only \
+  --artifact /home/jmha/MobiZO/et_training_artifacts/gpt2_tiny_training_android.pte
+```
+
+Run it on device:
+
+```bash
+python android/et/et_run.py \
+  -s <adb-serial> \
+  -b $EXECUTORCH_ROOT/build-android-qnn237 \
+  --artifact_path /home/jmha/MobiZO/et_training_artifacts/gpt2_tiny_training_android.pte \
+  --artifact_dir ./gpt2_training_phone_baseline \
+  --steps 50 \
+  --eval_steps 8
+```
+
+The runner prints `RESULT ...` lines for:
+- pre/post eval loss
+- average step time
+- RSS/HWM memory
+- optional trained weight save via `--save_ptd_path`
+
+On the current setup (`R3CR80BDZAY`, tiny GPT2, 50 steps), the baseline ran on
+device with about `9.72 ms/step`, `~6.4 MB` RSS, and post-eval loss dropping
+from `3.489` to `1.876`.

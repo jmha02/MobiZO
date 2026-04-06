@@ -8,6 +8,7 @@
 # pyre-ignore-all-errors
 
 import argparse
+from copy import deepcopy
 import os
 import subprocess
 import sys
@@ -19,20 +20,29 @@ from typing import Callable, List, Optional
 import numpy as np
 
 import torch
-from executorch.backends.qualcomm.partition.qnn_partitioner import QnnPartitioner
+from executorch.backends.qualcomm._passes import TagQuantIO
+from executorch.backends.qualcomm._passes.build_quant_io import BuildQuantIo
+from executorch.backends.qualcomm._passes.qnn_pass_manager import (
+    get_capture_program_passes,
+)
 from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer, QuantDtype
 from executorch.backends.qualcomm.serialization.qc_schema import QcomChipset
+from executorch.backends.qualcomm.utils.constants import (
+    QCOM_DTYPE,
+    QCOM_PASS_ACTIVATE_KEY,
+    QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY,
+    QCOM_QUANT_ATTRS,
+    QCOM_QUANT_ATTRS_MAP,
+)
 from executorch.backends.qualcomm.utils.utils import (
-    capture_program,
     generate_htp_compiler_spec,
     generate_qnn_executorch_compiler_spec,
     get_soc_to_arch_map,
+    to_edge_transform_and_lower_to_qnn,
 )
-from executorch.exir import EdgeCompileConfig, EdgeProgramManager, to_edge
-from executorch.exir.backend.backend_api import to_backend
 from executorch.exir.capture._config import ExecutorchBackendConfig
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
-from torch.ao.quantization.observer import MovingAverageMinMaxObserver
+from torchao.quantization.pt2e import MinMaxObserver, MovingAverageMinMaxObserver
 try:
     from torch.ao.quantization.quantize_pt2e import (
         convert_pt2e,
@@ -140,6 +150,13 @@ class SimpleADB:
             f"{self.build_path}/{self.runner}",
             f"{self.build_path}/backends/qualcomm/libqnn_executorch_backend.so",
         ]
+        optional_artifacts = [
+            f"{self.qnn_sdk}/lib/aarch64-android/libQnnIr.so",
+            f"{self.qnn_sdk}/lib/aarch64-android/libQnnModelDlc.so",
+        ]
+        artifacts.extend(
+            artifact for artifact in optional_artifacts if os.path.isfile(artifact)
+        )
         input_list_file, input_files = generate_inputs(
             self.working_dir, self.input_list_filename, inputs, input_list
         )
@@ -280,19 +297,95 @@ def qat_train(ori_model, captured_model, quantizer, dataset):
 def make_quantizer(
     quant_dtype: Optional[QuantDtype] = QuantDtype.use_8a8w,
     custom_annotations=(),
-    per_block_conv=False,
     per_channel_conv=True,
     per_channel_linear=False,
     act_observer=MovingAverageMinMaxObserver,
     is_qat=False,
+    submodule_qconfig_list=None,
+    eps=None,
 ):
     quantizer = QnnQuantizer()
     quantizer.add_custom_quant_annotations(custom_annotations)
-    quantizer.set_per_block_conv_quant(per_block_conv)
-    quantizer.set_per_channel_conv_quant(per_channel_conv)
-    quantizer.set_per_channel_linear_quant(per_channel_linear)
-    quantizer.set_quant_config(quant_dtype, is_qat, act_observer)
+    quantizer.set_default_quant_config(
+        quant_dtype,
+        is_qat=is_qat,
+        is_conv_per_channel=per_channel_conv,
+        is_linear_per_channel=per_channel_linear,
+        act_observer=act_observer,
+        eps=eps,
+    )
+    quantizer.set_submodule_qconfig_list(submodule_qconfig_list or [])
     return quantizer
+
+
+def make_llm_quantizer(
+    quant_dtype: Optional[QuantDtype] = QuantDtype.use_8a8w,
+):
+    # Match the upstream Qualcomm LLM PTQ recipe more closely than the generic path.
+    return make_quantizer(
+        quant_dtype=quant_dtype,
+        per_channel_conv=True,
+        per_channel_linear=True,
+        act_observer=MinMaxObserver,
+    )
+
+
+def get_quant_io_dtype(quant_dtype: QuantDtype) -> torch.dtype:
+    if quant_dtype == QuantDtype.use_8a8w:
+        return torch.uint8
+    if quant_dtype == QuantDtype.use_16a16w:
+        return torch.uint16
+    raise ValueError(f"Unsupported quantized I/O dtype for {quant_dtype}")
+
+
+def make_quant_io_passes_job(passes_job, quant_io_dtype: torch.dtype):
+    quant_io_passes_job = deepcopy(passes_job or get_capture_program_passes())
+    quant_io_passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
+    quant_io_passes_job[TagQuantIO][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+        "get_quant_io_dtype_fn"
+    ] = lambda node: (
+        quant_io_dtype
+        if (
+            (node.op == "placeholder" and QCOM_QUANT_ATTRS in node.meta)
+            or (
+                QCOM_QUANT_ATTRS in node.meta
+                and any(user.op == "output" for user in node.users)
+            )
+        )
+        else None
+    )
+    return quant_io_passes_job
+
+
+def collect_quant_io_info(edge_prog_mgr, quant_io_dtype: torch.dtype):
+    input_encodings = []
+    output_encodings = []
+    for node in edge_prog_mgr.exported_program().graph.nodes:
+        if node.op == "placeholder":
+            quant_attrs = node.meta.get(QCOM_QUANT_ATTRS)
+            if quant_attrs is None:
+                input_encodings.append(None)
+            else:
+                input_quant_attrs = dict(quant_attrs)
+                input_quant_attrs[QCOM_DTYPE] = quant_io_dtype
+                input_encodings.append(input_quant_attrs)
+        elif node.op == "output":
+            quant_attrs_map = node.meta.get(QCOM_QUANT_ATTRS_MAP, {})
+            quant_attrs_values = list(quant_attrs_map.values())
+            for output_arg in node.args[0]:
+                quant_attrs = quant_attrs_map.get(output_arg)
+                if quant_attrs is None and quant_attrs_values:
+                    quant_attrs = quant_attrs_values[len(output_encodings)]
+                if quant_attrs is None:
+                    output_encodings.append(None)
+                else:
+                    output_quant_attrs = dict(quant_attrs)
+                    output_quant_attrs[QCOM_DTYPE] = quant_io_dtype
+                    output_encodings.append(output_quant_attrs)
+    return {
+        "input_encodings": tuple(input_encodings),
+        "output_encodings": tuple(output_encodings),
+    }
 
 
 # TODO: refactor to support different backends
@@ -310,7 +403,11 @@ def build_executorch_binary(
     metadata=None,
     dump_intermediate_outputs=False,
     passes_job=None,
+    online_prepare=False,
+    use_mha2sha=False,
+    convert_linear_to_conv2d=False,
     qat_training_data=None,
+    quantized_io=False,
 ):
     """
     A function to generate an ExecuTorch binary for Qualcomm platforms.
@@ -333,8 +430,27 @@ def build_executorch_binary(
     Returns:
         None: The function writes the output to a specified .pte file.
     """
-    if quant_dtype is not None:
-        captured_model = torch.export.export(model, inputs, strict=True).module()
+    backend_options = generate_htp_compiler_spec(
+        use_fp16=False if quant_dtype else True
+    )
+    compile_spec = generate_qnn_executorch_compiler_spec(
+        soc_model=getattr(QcomChipset, soc_model),
+        backend_options=backend_options,
+        online_prepare=online_prepare,
+        shared_buffer=shared_buffer,
+        dump_intermediate_outputs=dump_intermediate_outputs,
+        use_mha2sha=use_mha2sha,
+    )
+
+    quant_io_dtype = None
+    if quantized_io:
+        if quant_dtype is None:
+            raise ValueError("quantized_io requires quant_dtype to be set")
+        quant_io_dtype = get_quant_io_dtype(quant_dtype)
+        passes_job = make_quant_io_passes_job(passes_job, quant_io_dtype)
+
+    if quant_dtype is not None or custom_quantizer is not None:
+        captured_model = torch.export.export(model, inputs, strict=False).module()
         if qat_training_data:
             quantizer = custom_quantizer or make_quantizer(
                 quant_dtype=quant_dtype, is_qat=True
@@ -346,26 +462,35 @@ def build_executorch_binary(
         else:
             quantizer = custom_quantizer or make_quantizer(quant_dtype=quant_dtype)
             # ptq calibration
-            annotated_model = ptq_calibrate(captured_model, quantizer, dataset)
+            with torch.no_grad():
+                annotated_model = ptq_calibrate(captured_model, quantizer, dataset)
 
         quantized_model = convert_pt2e(annotated_model)
-        edge_prog = capture_program(quantized_model, inputs, passes_job)
+        edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
+            quantized_model,
+            inputs,
+            compile_spec,
+            constant_methods=metadata,
+            passes_job=passes_job,
+            skip_node_id_set=skip_node_id_set,
+            skip_node_op_set=skip_node_op_set,
+            convert_linear_to_conv2d=convert_linear_to_conv2d,
+        )
     else:
-        edge_prog = capture_program(model, inputs, passes_job)
+        edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
+            model,
+            inputs,
+            compile_spec,
+            constant_methods=metadata,
+            passes_job=passes_job,
+            skip_node_id_set=skip_node_id_set,
+            skip_node_op_set=skip_node_op_set,
+            convert_linear_to_conv2d=convert_linear_to_conv2d,
+        )
 
-    backend_options = generate_htp_compiler_spec(
-        use_fp16=False if quant_dtype else True
-    )
-    qnn_partitioner = QnnPartitioner(
-        generate_qnn_executorch_compiler_spec(
-            soc_model=getattr(QcomChipset, soc_model),
-            backend_options=backend_options,
-            shared_buffer=shared_buffer,
-            dump_intermediate_outputs=dump_intermediate_outputs,
-        ),
-        skip_node_id_set,
-        skip_node_op_set,
-    )
+    quant_io_info = None
+    if quantized_io:
+        quant_io_info = collect_quant_io_info(edge_prog_mgr, quant_io_dtype)
 
     executorch_config = ExecutorchBackendConfig(
         # For shared buffer, user must pass the memory address
@@ -376,25 +501,26 @@ def build_executorch_binary(
             alloc_graph_input=not shared_buffer,
             alloc_graph_output=not shared_buffer,
         ),
+        passes=[
+            BuildQuantIo(
+                input_quantized_dtypes=tuple(
+                    None if encoding is None else encoding[QCOM_DTYPE]
+                    for encoding in quant_io_info["input_encodings"]
+                ),
+                output_quantized_dtypes=tuple(
+                    None if encoding is None else encoding[QCOM_DTYPE]
+                    for encoding in quant_io_info["output_encodings"]
+                ),
+            )
+        ]
+        if quantized_io
+        else [],
     )
 
-    if metadata is None:
-        exported_program = to_backend(edge_prog.exported_program, qnn_partitioner)
-        exported_program.graph_module.graph.print_tabular()
-        exec_prog = to_edge(exported_program).to_executorch(config=executorch_config)
-        with open(f"{file_name}.pte", "wb") as file:
-            file.write(exec_prog.buffer)
-    else:
-        edge_prog_mgr = EdgeProgramManager(
-            edge_programs={"forward": edge_prog.exported_program},
-            constant_methods=metadata,
-            compile_config=EdgeCompileConfig(_check_ir_validity=False),
-        )
-
-        edge_prog_mgr = edge_prog_mgr.to_backend(qnn_partitioner)
-        exec_prog_mgr = edge_prog_mgr.to_executorch(config=executorch_config)
-        with open(f"{file_name}.pte", "wb") as file:
-            file.write(exec_prog_mgr.buffer)
+    exec_prog_mgr = edge_prog_mgr.to_executorch(config=executorch_config)
+    with open(f"{file_name}.pte", "wb") as file:
+        exec_prog_mgr.write_to_file(file)
+    return quant_io_info
 
 
 def make_output_dir(path: str):
@@ -509,6 +635,13 @@ def setup_common_args_and_variables():
         help="hostname where android device is connected.",
         default=None,
         type=str,
+    )
+
+    parser.add_argument(
+        "--online_prepare",
+        help="If specified, compose QNN graph on device.",
+        action="store_true",
+        default=False,
     )
 
     parser.add_argument(
